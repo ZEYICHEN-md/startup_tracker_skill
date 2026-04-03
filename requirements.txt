@@ -1,0 +1,9 @@
+# Core dependencies for startup-tracker
+requests>=2.28.0
+python-dotenv>=1.0.0
+
+# Optional: website monitoring
+crawl4ai>=0.2.0
+
+# Optional: translation (falls back to English if not installed)
+deep_translator>=1.11.0

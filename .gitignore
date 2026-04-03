@@ -1,0 +1,15 @@
+# Secrets and config (containing API keys)
+.env
+config.json
+
+# Runtime state
+state/
+
+# Reports directory (optional — 如需公开报告可注释掉)
+reports/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env.example

@@ -1,0 +1,60 @@
+{
+  "_comment": "复制此文件为 config.json 并填入你的数据。",
+  "_why_manual_urls": "AI 领域公司名称高度重复（如同名 'Nova AI' 可能有十几家），自动搜索极易张冠李戴。同时 AI 自动查询博客/新闻页的准确率不稳定。由用户提供链接可以确保监控的是目标公司，而非同名其他实体，同时避免遗漏关键更新。",
+
+  "companies": [
+    {
+      "name": "公司显示名（如 OpenAI、月之暗面）",
+      "website": "公司官网首页 URL（完整 https:// 开头，如 https://openai.com）",
+
+      "monitor_urls": [
+        "https://example.com",
+        "https://example.com/blog",
+        "https://example.com/news"
+      ],
+
+      "x_handle": "example_handle",
+      "linkedin_url": "https://www.linkedin.com/company/example/posts/",
+      "priority": "high",
+      "exclude_keywords": ["排除无关结果的关键词"]
+    }
+  ],
+
+  "_data_sources": {
+    "news": "tavily",
+    "website": "crawl4ai",
+    "linkedin": true,
+    "twitter": true
+  },
+
+  "apify": {
+    "twitter_actor_id": "parseforge/x-com-scraper",
+    "linkedin_actor_id": "supreme_coder/linkedin-post",
+    "max_tweets_per_run": 10,
+    "max_linkedin_posts_per_run": 10,
+    "poll_interval_sec": 5,
+    "max_poll_sec": 120
+  },
+
+  "website_monitor": {
+    "engine": "crawl4ai",
+    "max_content_chars": 2000,
+    "use_article_signature": true
+  },
+
+  "tavily": {
+    "search_days_back": 7,
+    "max_results_per_company": 10,
+    "major_keywords": [
+      "funding", "raises", "raised", "million", "acquired",
+      "IPO", "launch", "partnership", "series"
+    ]
+  },
+
+  "_api_keys": "通过对话配置或在 api_keys 中填入（优先于命令行参数）",
+  "api_keys": {
+    "tavily": "",
+    "apify": "",
+    "firecrawl": ""
+  }
+}
