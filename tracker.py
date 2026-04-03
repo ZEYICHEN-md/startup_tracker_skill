@@ -56,11 +56,13 @@ parser.add_argument("--validate", action="store_true",
                     help="Validate API keys without running full scan")
 parser.add_argument("--days", type=int, default=None,
                     help="Override monitoring window in days (overrides config.monitor_interval_days and tavily.search_days_back)")
+parser.add_argument("--workers", type=int, default=5,
+                    help="Max parallel workers for concurrent requests (default: 5)")
 args = parser.parse_args()
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).parent.resolve()
-load_dotenv(SCRIPT_DIR / ".env")  # load .env from the same directory as script (skill directory)
+load_dotenv(SCRIPT_DIR / ".env")  # load .env from the same directory as script
 
 DEFAULT_CONFIG = SCRIPT_DIR / "config.json"
 STATE_DIR = SCRIPT_DIR / "state"
@@ -94,7 +96,7 @@ def load_config():
     config_path = Path(args.config) if args.config else DEFAULT_CONFIG
     if not config_path.exists():
         print(f"[Error] Config not found: {config_path}")
-        print("  → Run: python tracker.py --init '<json>'  (Agent调用)")
+        print("  → Run: python tracker.py --init '<json>'  (Agent 调用)")
         print("  → Or:  /startup-tracker  (首次会自动引导)")
         sys.exit(1)
     cfg = json.loads(config_path.read_text(encoding="utf-8"))
@@ -104,12 +106,10 @@ def load_config():
         sys.exit(1)
 
     def _key(cfg_key, env_var):
-        # cfg_key e.g. "tavily-key" -> "tavily"; looks up "tavily" in api_keys
-        cfg_name = cfg_key.replace("-","_").replace("_key","")
+        cfg_name = cfg_key.replace("-", "_").replace("_key", "")
         api_keys = cfg.get("api_keys", {})
-        # Support both short-form ("tavily") and full env-style ("TAVILY_API_KEY") keys
         return (
-            getattr(args, cfg_key.replace("-","_"), None)
+            getattr(args, cfg_key.replace("-", "_"), None)
             or api_keys.get(cfg_name.lower())
             or api_keys.get(env_var)
             or os.environ.get(env_var)
@@ -125,7 +125,6 @@ def load_config():
         monitor_days = cfg.get("monitor_interval_days")
     if monitor_days is None:
         monitor_days = cfg.get("tavily", {}).get("search_days_back", 7)
-    # Also update tavily.search_days_back so downstream functions see the same window
     tavily_cfg = cfg.setdefault("tavily", {})
     tavily_cfg["search_days_back"] = monitor_days
     monitor_days = max(1, monitor_days)
@@ -146,12 +145,19 @@ def validate_tavily_key(key: str) -> tuple[bool, str]:
         cmd = ["tvly", "search", "test", "--max-results", "1", "--json"]
         env = {**os.environ, "TAVILY_API_KEY": key}
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
+        # If command succeeded and returned valid JSON, key is valid
+        # Ignore stderr warnings (e.g. Python dependency version mismatches)
+        if result.stdout.strip():
+            try:
+                json.loads(result.stdout)
+                return True, "Valid"
+            except json.JSONDecodeError:
+                pass  # not JSON, fall through to error
         if result.returncode != 0:
-            error = result.stderr.strip() if result.stderr else "Unknown error"
-            return False, error
-        # Try to parse JSON to confirm it worked
-        json.loads(result.stdout)
-        return True, "Valid"
+            error_lines = [l for l in result.stderr.strip().splitlines()
+                           if "warning" not in l.lower()]
+            return False, error_lines[-1] if error_lines else "Unknown error"
+        return False, "Unexpected response format"
     except subprocess.TimeoutExpired:
         return False, "Request timeout"
     except json.JSONDecodeError:
@@ -164,9 +170,10 @@ def validate_apify_key(key: str) -> tuple[bool, str]:
     if not key:
         return False, "Key is empty"
     headers = {"Authorization": f"Bearer {key}"}
+    verify_ssl = os.environ.get("SSL_VERIFY", "true").lower() != "false"
     for attempt in range(3):
         try:
-            r = requests.get("https://api.apify.com/v2/users/me", headers=headers, timeout=60, verify=False)
+            r = requests.get("https://api.apify.com/v2/users/me", headers=headers, timeout=60, verify=verify_ssl)
             if r.status_code == 200:
                 return True, "Valid"
             elif r.status_code == 401:
@@ -204,7 +211,6 @@ def check_config_status(config_path: Path = DEFAULT_CONFIG) -> dict:
 
         api_keys = cfg.get("api_keys", {})
 
-        # Check Tavily — fallback across multiple config key namings + env var
         tavily_key = (
             api_keys.get("tavily")
             or api_keys.get("TAVILY_API_KEY")
@@ -217,7 +223,6 @@ def check_config_status(config_path: Path = DEFAULT_CONFIG) -> dict:
             status["tavily"]["valid"] = valid
             status["tavily"]["error"] = error if not valid else ""
 
-        # Check Apify — fallback across multiple config key namings + env var
         apify_key = (
             api_keys.get("apify")
             or api_keys.get("APIFY_TOKEN")
@@ -230,14 +235,11 @@ def check_config_status(config_path: Path = DEFAULT_CONFIG) -> dict:
             status["apify"]["valid"] = valid
             status["apify"]["error"] = error if not valid else ""
 
-        # Check Firecrawl — fallback to env var if config key is empty
         firecrawl_key = api_keys.get("firecrawl") or os.environ.get("FIRECRAWL_API_KEY") or ""
         if firecrawl_key:
             status["firecrawl"]["configured"] = True
-            # Firecrawl validation would require a test request
             status["firecrawl"]["valid"] = True
 
-        # Check if any company has social handles
         for comp in cfg.get("companies", []):
             if comp.get("x_handle"):
                 status["twitter_enabled"] = True
@@ -249,7 +251,7 @@ def check_config_status(config_path: Path = DEFAULT_CONFIG) -> dict:
 
     return status
 
-# ── JSON Helpers
+# ── Helpers ──────────────────────────────────────────────────────────────────
 def load_json(path: Path, default=None):
     if path.exists():
         with open(path, "r", encoding="utf-8") as f:
@@ -263,7 +265,14 @@ def save_json(path: Path, data):
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-# ── Source Name ───────────────────────────────────────────────────────────────
+def _get_monitor_urls(comp: Dict) -> List[str]:
+    """Extract monitor URLs for a company: explicit list or fallback to website."""
+    urls = comp.get("monitor_urls", [])
+    if urls:
+        return urls
+    website = comp.get("website", "").strip().rstrip("/")
+    return [website] if website else []
+
 def get_source_name(url: str) -> str:
     domain_map = {
         "businesswire.com": "BusinessWire", "prnewswire.com": "PR Newswire",
@@ -292,12 +301,12 @@ def get_source_name(url: str) -> str:
     except Exception:
         return "Unknown"
 
-# ── Date Utilities ─────────────────────────────────────────────────────────────
+# ── Date Utilities ───────────────────────────────────────────────────────────
 _MONTH_NUM = {
-    "jan":"01","feb":"02","mar":"03","apr":"04","may":"05","jun":"06",
-    "jul":"07","aug":"08","sep":"09","oct":"10","nov":"11","dec":"12",
-    "january":"01","february":"02","march":"03","april":"04","june":"06",
-    "july":"07","august":"08","september":"09","october":"10","november":"11","december":"12",
+    "jan": "01", "feb": "02", "mar": "03", "apr": "04", "may": "05", "jun": "06",
+    "jul": "07", "aug": "08", "sep": "09", "oct": "10", "nov": "11", "dec": "12",
+    "january": "01", "february": "02", "march": "03", "april": "04", "june": "06",
+    "july": "07", "august": "08", "september": "09", "october": "10", "november": "11", "december": "12",
 }
 
 def _month_num(name: str) -> str:
@@ -324,21 +333,15 @@ def extract_date_from_content(content: str, url: str = "") -> str:
     return ""
 
 def is_within_days(date_str: str, days: int) -> bool:
-    """Return True if date_str is within the last `days` days.
-
-    Supports multiple formats:
-    - ISO formats: 2026-03-25, 2026-03-25T20:12:34, 2026-03-25T20:12:34Z
-    - RFC 2822: Wed, 25 Mar 2026 20:12:34 GMT (Tavily returns this)
-    """
+    """Return True if date_str is within the last `days` days."""
     if not date_str:
-        return True  # Trust API filter if no date provided
+        return True
 
-    # Try RFC 2822 format first (Tavily returns this: "Wed, 25 Mar 2026 20:12:34 GMT")
     rfc_formats = [
-        "%a, %d %b %Y %H:%M:%S %Z",      # Wed, 25 Mar 2026 20:12:34 GMT
-        "%a, %d %b %Y %H:%M:%S GMT",     # Wed, 25 Mar 2026 20:12:34 GMT (explicit)
-        "%d %b %Y %H:%M:%S %Z",          # 25 Mar 2026 20:12:34 GMT
-        "%d %b %Y %H:%M:%S",             # 25 Mar 2026 20:12:34
+        "%a, %d %b %Y %H:%M:%S %Z",
+        "%a, %d %b %Y %H:%M:%S GMT",
+        "%d %b %Y %H:%M:%S %Z",
+        "%d %b %Y %H:%M:%S",
     ]
     for fmt in rfc_formats:
         try:
@@ -348,7 +351,6 @@ def is_within_days(date_str: str, days: int) -> bool:
         except ValueError:
             continue
 
-    # Try ISO formats
     iso_formats = [
         "%Y-%m-%d",
         "%Y-%m-%dT%H:%M:%S",
@@ -366,57 +368,39 @@ def is_within_days(date_str: str, days: int) -> bool:
         except ValueError:
             continue
 
-    # If we can't parse the date, trust the API's time-range filter
     return True
 
 def _resolve_date(api_date: str, content_date: str, days_back: int) -> Optional[str]:
     """Cross-validate API date against content-extracted date.
-
-    Returns a resolved date string (YYYY-MM-DD) if within the window,
-    or None to filter out the item.
-
-    Strategy:
-    1. If both dates are available and both parse successfully:
-       - If they match (same day): high confidence, use it
-       - If they differ by <= 3 days: moderate confidence, use the earlier one
-       - If they differ by > 3 days: suspicious, but keep the earlier one
-         if it's within the window (API date may be the article pub date,
-         content date may be the event date)
-    2. If only API date is available: use it (trust the API filter)
-    3. If only content date is available: fall back to content extraction
-    4. If neither is available: return a sentinel (caller decides)
-    """
+    Returns YYYY-MM-DD string or None to filter out."""
     api_valid = api_date and is_within_days(api_date, days_back)
     content_valid = content_date and is_within_days(content_date, days_back)
 
     if api_valid and content_valid:
-        # Both dates parse and are within window — compare
         try:
             api_dt = _parse_to_datetime(api_date)
             content_dt = _parse_to_datetime(content_date)
             if api_dt and content_dt:
                 delta = abs((api_dt - content_dt).days)
-                if delta == 0:
-                    pass  # Exact match, high confidence
-                elif delta <= 3:
-                    pass  # Close enough, minor discrepancy
-                else:
+                if delta > 3:
                     print(f"  [Date Mismatch] API={api_date} vs Content={content_date} (Δ{delta}d), using earlier")
-                # Use the earlier date to be conservative
                 earlier_dt = min(api_dt, content_dt)
                 return earlier_dt.strftime("%Y-%m-%d")
         except Exception:
             pass
-        # If comparison failed for any reason, fall through to single-source logic
-        return api_date[:10]
+        # Fallback: parse API date to YYYY-MM-DD
+        dt = _parse_to_datetime(api_date)
+        if dt:
+            return dt.strftime("%Y-%m-%d")
 
     if api_valid:
-        return api_date[:10]
+        dt = _parse_to_datetime(api_date)
+        if dt:
+            return dt.strftime("%Y-%m-%d")
 
     if content_valid:
         return content_date
 
-    # Neither source produced a usable date — filter out the item
     return None
 
 def _parse_to_datetime(date_str: str) -> Optional[datetime.datetime]:
@@ -451,9 +435,6 @@ def _parse_to_datetime(date_str: str) -> Optional[datetime.datetime]:
     return None
 
 # ── Tavily ────────────────────────────────────────────────────────────────────
-# Tavily API only supports coarse time windows: day / week / month / year.
-# We always pick the smallest window that fully covers `days_back`, then
-# re-filter results locally with `is_within_days()`.
 def _days_to_time_range(days_back: int) -> str:
     """Map exact days to the smallest Tavily time window that covers them."""
     if days_back <= 1: return "day"
@@ -483,87 +464,98 @@ def search_tavily(query: str, max_results: int = 10, days_back: int = 7) -> List
         print(f"[Tavily Error] {query}: {e}")
         return []
 
-def run_tavily(companies: List[Dict], config: Dict) -> List[Dict]:
+def _search_one_company(comp: Dict, config: Dict) -> List[Dict]:
+    """Search Tavily for a single company. Used for parallel execution."""
     if not TAVILY_API_KEY:
-        print("[Tavily] 跳过 — 未配置 TAVILY_API_KEY")
         return []
     settings = config.get("tavily", {})
     max_results = settings.get("max_results_per_company", 10)
     major_keywords = settings.get("major_keywords", [])
     days_back = settings.get("search_days_back", 7)
 
+    name = comp["name"]
     seen = load_json(TAVILY_STATE, {"urls": []})
-    seen_urls = set(seen.get("urls", []))
+    company_urls = set(seen.get("urls", []))
     items = []
 
-    for comp in companies:
-        name = comp["name"]
-        # Pass 1: keyword-constrained search for significant events
-        query = f'"{name}" funding OR launch OR product OR partnership OR series OR acquired OR acquisition OR investment OR expansion OR IPO OR merger OR round'
-        print(f"[Tavily] Search: {name} ...")
-        results = search_tavily(query, max_results=max_results, days_back=days_back)
-        exclude_keywords = [k.lower() for k in comp.get("exclude_keywords", [])]
-        # If no results from keyword search, fall back to company-name-only search
-        if not results:
-            print(f"[Tavily] 关键词搜索无结果，尝试放宽为仅搜索公司名称: \"{name}\"")
-            results = search_tavily(f'"{name}"', max_results=max_results, days_back=days_back)
-        for r in results[:max_results]:
-            url = r.get("url", "")
-            if not url or url in seen_urls:
-                continue
-            api_date = r.get("published_date", "") or ""
-            raw_content = r.get("raw_content", "") or ""
-            content_date = extract_date_from_content(raw_content, url)
-            # Cross-validate dates: use API date if available, supplement with
-            # content-extracted date, and pick the more conservative (earlier) one
-            # that is still within the search window.
-            published_date = _resolve_date(api_date, content_date, days_back)
-            # Filter out items that are verifiably outside the time window
-            if published_date is None:
-                continue
-            published_date = published_date  # now str
-            title = r.get("title", "无标题")
-            snippet = r.get("content", "")
-            combined = (title + " " + snippet).lower()
-            if exclude_keywords and any(kw in combined for kw in exclude_keywords):
-                continue
-            # Relevance filter: require company name to appear in title
-            # For multi-word names like "Human Delta", require both words or full phrase
-            # For single-word names like "Roe", require exact match (not just substring)
-            title_lower = title.lower()
-            name_lower = name.lower()
+    # Pass 1: keyword-constrained search
+    query = f'"{name}" funding OR launch OR product OR partnership OR series OR acquired OR acquisition OR investment OR expansion OR IPO OR merger OR round'
+    print(f"[Tavily] Search: {name} ...")
+    results = search_tavily(query, max_results=max_results, days_back=days_back)
+    exclude_keywords = [k.lower() for k in comp.get("exclude_keywords", [])]
 
-            relevant = False
-            if name_lower in title_lower:
-                # Full company name appears in title - good match
-                relevant = True
-            else:
-                # For multi-word names, check if ALL significant parts appear in title
-                # This prevents "Human Delta" matching "Delta" (airline)
-                name_parts = [p.lower() for p in name.split() if len(p) > 2]
-                if len(name_parts) >= 2:
-                    # Multi-word company: require all words to appear (or at least 2)
-                    matching_parts = sum(1 for part in name_parts if part in title_lower)
-                    # Require at least 2 matching parts, or all if only 2 total
-                    relevant = matching_parts >= 2 or (len(name_parts) == 2 and matching_parts == 2)
-                elif len(name_parts) == 1:
-                    # Single word company: require exact word match (not substring)
-                    # Use word boundary check
-                    relevant = bool(re.search(r'\b' + re.escape(name_parts[0]) + r'\b', title_lower))
+    # Fallback: bare company name search if keyword search yields nothing
+    if not results:
+        print(f"[Tavily] 关键词搜索无结果，尝试放宽为仅搜索公司名称: \"{name}\"")
+        results = search_tavily(f'"{name}"', max_results=max_results, days_back=days_back)
 
-            if not relevant:
-                continue
-            seen_urls.add(url)
-            imp = "MAJOR" if any(kw.lower() in combined for kw in major_keywords) else "NORMAL"
-            items.append({
-                "company": name, "source": "tavily",
-                "title": title, "url": url,
-                "snippet": snippet[:300], "published_date": published_date,
-                "importance": imp,
-            })
-    save_json(TAVILY_STATE, {"urls": list(seen_urls)})
-    print(f"[Tavily] 新增 {len(items)} 条")
-    return items
+    for r in results[:max_results]:
+        url = r.get("url", "")
+        if not url or url in company_urls:
+            continue
+        api_date = r.get("published_date", "") or ""
+        raw_content = r.get("raw_content", "") or ""
+        content_date = extract_date_from_content(raw_content, url)
+        published_date = _resolve_date(api_date, content_date, days_back)
+        if published_date is None:
+            continue
+        title = r.get("title", "无标题")
+        snippet = r.get("content", "")
+        combined = (title + " " + snippet).lower()
+        if exclude_keywords and any(kw in combined for kw in exclude_keywords):
+            continue
+
+        # Relevance filter
+        title_lower = title.lower()
+        name_lower = name.lower()
+        relevant = False
+        if name_lower in title_lower:
+            relevant = True
+        else:
+            name_parts = [p.lower() for p in name.split() if len(p) > 2]
+            if len(name_parts) >= 2:
+                matching_parts = sum(1 for part in name_parts if part in title_lower)
+                relevant = matching_parts >= 2
+            elif len(name_parts) == 1:
+                relevant = bool(re.search(r'\b' + re.escape(name_parts[0]) + r'\b', title_lower))
+
+        if not relevant:
+            continue
+        company_urls.add(url)
+        imp = "MAJOR" if any(kw.lower() in combined for kw in major_keywords) else "NORMAL"
+        items.append({
+            "company": name, "source": "tavily",
+            "title": title, "url": url,
+            "snippet": snippet[:300], "published_date": published_date,
+            "importance": imp,
+        })
+
+    # Save per-company URLs — will be merged by caller
+    return items, company_urls
+
+def run_tavily(companies: List[Dict], config: Dict, max_workers: int = 5) -> List[Dict]:
+    """Run Tavily news search for all companies in parallel."""
+    if not TAVILY_API_KEY:
+        print("[Tavily] 跳过 — 未配置 TAVILY_API_KEY")
+        return []
+
+    global_all_urls = set(load_json(TAVILY_STATE, {"urls": []}).get("urls", []))
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(companies))) as executor:
+        futures = {executor.submit(_search_one_company, comp, config): comp for comp in companies}
+        all_items = []
+        for future in as_completed(futures):
+            try:
+                items, company_urls = future.result()
+                all_items.extend(items)
+                global_all_urls.update(company_urls)
+            except Exception as e:
+                comp = futures[future]
+                print(f"[Tavily Error] {comp['name']}: {e}")
+
+    save_json(TAVILY_STATE, {"urls": list(global_all_urls)})
+    print(f"[Tavily] 新增 {len(all_items)} 条")
+    return all_items
 
 # ── Crawl4AI ─────────────────────────────────────────────────────────────────
 async def crawl4ai_scrape(url: str) -> Optional[str]:
@@ -582,7 +574,7 @@ def extract_article_signatures(markdown: str) -> str:
     signatures = []
     skip_texts = (
         "trusted by leading enterprises worldwide", "solutions", "company overview",
-        "products", "resources", "case studies", "team", "careers",
+        "products", "case studies", "team", "careers",
         "webinars", "blogs", "research"
     )
     for line in lines:
@@ -603,6 +595,7 @@ def extract_article_signatures(markdown: str) -> str:
     return "\n".join(signatures[:80]) if signatures else markdown
 
 def run_crawl4ai(companies: List[Dict], config: Dict) -> List[Dict]:
+    """Run Crawl4AI website monitoring with asyncio.gather for parallel crawling."""
     if not CRAWL4AI_AVAILABLE:
         print("[Crawl4AI] 跳过 — 未安装 crawl4ai")
         return []
@@ -612,38 +605,55 @@ def run_crawl4ai(companies: List[Dict], config: Dict) -> List[Dict]:
     use_article_sig = cfg.get("use_article_signature", True)
     state = load_json(CRAWL4AI_STATE, {})
     items = []
+    first_run_keys = []
 
-    async def _process():
-        first_run_keys = []
-        for comp in companies:
-            name = comp["name"]
-            urls = comp.get("monitor_urls", []) or ([comp["website"].strip().rstrip("/")] if comp.get("website") else [])
-            for url in urls:
-                md = await crawl4ai_scrape(url)
-                if md is None:
-                    continue
-                content = md.strip()
-                if len(content) < 50:
-                    continue
-                key = f"{name}::{url}"
-                sig_text = extract_article_signatures(content) if use_article_sig else content
-                current_hash = sha256_text(sig_text[:max_chars])
-                prev_hash = state.get(key, "")
-                if not prev_hash:
-                    first_run_keys.append(f"{name} ({url})")
-                if prev_hash and prev_hash != current_hash:
-                    items.append({
-                        "company": name, "source": "crawl4ai",
-                        "title": f"[Website Update] {name} - {url.replace(comp.get('website','').rstrip('/'),'') or '/'}",
-                        "url": url, "snippet": content[:300].replace("\n"," "),
-                        "published_date": "", "importance": "NORMAL",
-                    })
-                state[key] = current_hash
-        if first_run_keys:
-            print(f"\n[Crawl4AI] 首次运行 — 已为以下站点建立基线: {', '.join(first_run_keys)}")
-            print("[Crawl4AI] 网站变更检测从第二次运行开始生效\n")
+    # Build all scrape tasks
+    tasks = []
+    task_meta = []  # (name, url, index)
+    for comp in companies:
+        name = comp["name"]
+        for url in _get_monitor_urls(comp):
+            idx = len(tasks)
+            tasks.append(crawl4ai_scrape(url))
+            task_meta.append((name, url, idx))
 
-    asyncio.run(_process())
+    if not tasks:
+        save_json(CRAWL4AI_STATE, state)
+        print(f"[Crawl4AI] 新增 0 条")
+        return []
+
+    async def _gather():
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+    results = asyncio.run(_gather())
+
+    for name, url, idx in task_meta:
+        md = results[idx]
+        if isinstance(md, Exception) or md is None:
+            continue
+        content = md.strip()
+        if len(content) < 50:
+            continue
+        key = f"{name}::{url}"
+        sig_text = extract_article_signatures(content) if use_article_sig else content
+        current_hash = sha256_text(sig_text[:max_chars])
+        prev_hash = state.get(key, "")
+        if not prev_hash:
+            first_run_keys.append(f"{name} ({url})")
+        if prev_hash and prev_hash != current_hash:
+            website = comp.get("website", "").rstrip("/")
+            items.append({
+                "company": name, "source": "crawl4ai",
+                "title": f"[Website Update] {name} - {url.replace(website, '') or '/'}",
+                "url": url, "snippet": content[:300].replace("\n", " "),
+                "published_date": "", "importance": "NORMAL",
+            })
+        state[key] = current_hash
+
+    if first_run_keys:
+        print(f"\n[Crawl4AI] 首次运行 — 已为以下站点建立基线: {', '.join(first_run_keys)}")
+        print("[Crawl4AI] 网站变更检测从第二次运行开始生效\n")
+
     save_json(CRAWL4AI_STATE, state)
     print(f"[Crawl4AI] 新增 {len(items)} 条")
     return items
@@ -652,11 +662,12 @@ def run_crawl4ai(companies: List[Dict], config: Dict) -> List[Dict]:
 def firecrawl_scrape(url: str) -> Optional[str]:
     if not FIRECRAWL_API_KEY:
         return None
+    verify_ssl = os.environ.get("SSL_VERIFY", "true").lower() != "false"
     try:
         r = requests.post(
             "https://api.firecrawl.dev/v1/scrape",
             headers={"Authorization": f"Bearer {FIRECRAWL_API_KEY}", "Content-Type": "application/json"},
-            json={"url": url, "formats": ["markdown"]}, timeout=40
+            json={"url": url, "formats": ["markdown"]}, timeout=40, verify=verify_ssl
         )
         r.raise_for_status()
         return r.json().get("data", {}).get("markdown", "")
@@ -664,38 +675,70 @@ def firecrawl_scrape(url: str) -> Optional[str]:
         print(f"[Firecrawl Error] {url}: {e}")
         return None
 
-def run_firecrawl(companies: List[Dict], config: Dict) -> List[Dict]:
+def _firecrawl_one_url(comp: Dict, url: str, cfg: Dict) -> Optional[Dict]:
+    """Scrape one URL via Firecrawl for parallel execution."""
+    if not FIRECRAWL_API_KEY:
+        return None
+    md = firecrawl_scrape(url)
+    if md is None:
+        return None
+    content = md.strip()
+    if len(content) < 50:
+        return None
+    name = comp["name"]
+    max_chars = cfg.get("max_content_chars", 2000)
+    use_article_sig = cfg.get("use_article_signature", True)
+    sig_text = extract_article_signatures(content) if use_article_sig else content
+    current_hash = sha256_text(sig_text[:max_chars])
+    return {
+        "name": name,
+        "url": url,
+        "content": content,
+        "hash": current_hash,
+    }
+
+def run_firecrawl(companies: List[Dict], config: Dict, max_workers: int = 5) -> List[Dict]:
+    """Run Firecrawl website monitoring with ThreadPoolExecutor for parallel scraping."""
     if not FIRECRAWL_API_KEY:
         print("[Firecrawl] 跳过 — 未配置 FIRECRAWL_API_KEY")
         return []
     cfg = config.get("website_monitor", {})
-    max_chars = cfg.get("max_content_chars", 2000)
-    use_article_sig = cfg.get("use_article_signature", True)
     state = load_json(FIRECRAWL_STATE, {})
     items = []
 
+    # Collect all URL tasks
+    url_tasks = []
     for comp in companies:
-        name = comp["name"]
-        urls = comp.get("monitor_urls", []) or ([comp["website"].strip().rstrip("/")] if comp.get("website") else [])
-        for url in urls:
-            md = firecrawl_scrape(url)
-            if md is None:
-                continue
-            content = md.strip()
-            if len(content) < 50:
-                continue
-            key = f"{name}::{url}"
-            sig_text = extract_article_signatures(content) if use_article_sig else content
-            current_hash = sha256_text(sig_text[:max_chars])
-            prev_hash = state.get(key, "")
-            if prev_hash and prev_hash != current_hash:
-                items.append({
-                    "company": name, "source": "firecrawl",
-                    "title": f"[Website Update] {name} - {url.replace(comp.get('website','').rstrip('/'),'') or '/'}",
-                    "url": url, "snippet": content[:300].replace("\n"," "),
-                    "published_date": "", "importance": "NORMAL",
-                })
-            state[key] = current_hash
+        for url in _get_monitor_urls(comp):
+            url_tasks.append((comp, url))
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(url_tasks))) as executor:
+        futures = {
+            executor.submit(_firecrawl_one_url, comp, url, cfg): (comp, url)
+            for comp, url in url_tasks
+        }
+        for future in as_completed(futures):
+            comp, url = futures[future]
+            try:
+                result = future.result()
+                if result is None:
+                    continue
+                name = result["name"]
+                content = result["content"]
+                current_hash = result["hash"]
+                key = f"{name}::{url}"
+                prev_hash = state.get(key, "")
+                if prev_hash and prev_hash != current_hash:
+                    website = comp.get("website", "").rstrip("/")
+                    items.append({
+                        "company": name, "source": "firecrawl",
+                        "title": f"[Website Update] {name} - {url.replace(website, '') or '/'}",
+                        "url": url, "snippet": content[:300].replace("\n", " "),
+                        "published_date": "", "importance": "NORMAL",
+                    })
+                state[key] = current_hash
+            except Exception as e:
+                print(f"[Firecrawl Error] {url}: {e}")
 
     save_json(FIRECRAWL_STATE, state)
     print(f"[Firecrawl] 新增 {len(items)} 条")
@@ -706,12 +749,12 @@ def run_apify_actor(actor_id: str, input_data: Dict, poll_interval: int = 5, max
     if not APIFY_TOKEN:
         return []
     headers = {"Authorization": f"Bearer {APIFY_TOKEN}", "Content-Type": "application/json"}
-    # Apify API v2 uses raw owner/name format in URL path (NOT "~" replacement)
     base = f"https://api.apify.com/v2/acts/{actor_id}"
+    verify_ssl = os.environ.get("SSL_VERIFY", "true").lower() != "false"
 
     # 1. Start run
     try:
-        r = requests.post(f"{base}/runs", headers=headers, json=input_data, timeout=30, verify=False)
+        r = requests.post(f"{base}/runs", headers=headers, json=input_data, timeout=30, verify=verify_ssl)
         r.raise_for_status()
         run_data = r.json()["data"]
         run_id = run_data["id"]
@@ -727,7 +770,7 @@ def run_apify_actor(actor_id: str, input_data: Dict, poll_interval: int = 5, max
     for _ in range(max_poll // poll_interval):
         time.sleep(poll_interval)
         try:
-            r2 = requests.get(f"{base}/runs/{run_id}", headers=headers, timeout=30, verify=False)
+            r2 = requests.get(f"{base}/runs/{run_id}", headers=headers, timeout=30, verify=verify_ssl)
             status = r2.json()["data"]["status"]
             final_status = status
             if status == "SUCCEEDED":
@@ -755,7 +798,7 @@ def run_apify_actor(actor_id: str, input_data: Dict, poll_interval: int = 5, max
             f"https://api.apify.com/v2/datasets/{dataset_id}/items",
             headers=headers, timeout=60,
             params={"clean": "true"},
-            verify=False
+            verify=verify_ssl
         )
         r3.raise_for_status()
         return r3.json()
@@ -763,18 +806,26 @@ def run_apify_actor(actor_id: str, input_data: Dict, poll_interval: int = 5, max
         print(f"[Apify Error] 获取数据集失败: {e}")
         return []
 
-def parse_linkedin_time(time_str: str) -> int:
+def _parse_linkedin_days(time_str: str) -> int:
+    """Parse relative time string to days ago. Uses regex to avoid single-char false matches."""
     if not time_str:
         return 999
     time_str = time_str.lower().strip()
-    try:
-        if "yr" in time_str: return int(re.sub(r"[^\d]", "", time_str)) * 365
-        if "mo" in time_str: return int(time_str.replace("mo","").strip()) * 30
-        if "w" in time_str: return int(time_str.replace("w","").strip()) * 7
-        if "d" in time_str: return int(time_str.replace("d","").strip())
-        if "h" in time_str or "min" in time_str or "s" in time_str: return 0
-    except:
-        pass
+    # Match <number><unit> patterns only
+    m = re.match(r"(\d+)\s*(yr|y)", time_str)
+    if m:
+        return int(m.group(1)) * 365
+    m = re.match(r"(\d+)\s*(mo|month)", time_str)
+    if m:
+        return int(m.group(1)) * 30
+    m = re.match(r"(\d+)\s*w(?:eek)?s?$", time_str)
+    if m:
+        return int(m.group(1)) * 7
+    m = re.match(r"(\d+)\s*d(?:ay)?s?$", time_str)
+    if m:
+        return int(m.group(1))
+    if re.search(r"\d+\s*h", time_str) or re.search(r"\d+\s*min", time_str) or re.search(r"\d+\s*s$", time_str):
+        return 0
     return 999
 
 def relative_time_to_date(time_str: str) -> str:
@@ -783,19 +834,24 @@ def relative_time_to_date(time_str: str) -> str:
     now = datetime.datetime.now()
     tl = time_str.lower().strip()
     try:
-        if "yr" in tl: dt = now - datetime.timedelta(days=int(re.sub(r"[^\d]","",tl)) * 365)
-        elif "mo" in tl: dt = now - datetime.timedelta(days=int(tl.replace("mo","").strip()) * 30)
-        elif "w" in tl: dt = now - datetime.timedelta(weeks=int(tl.replace("w","").strip()))
-        elif "d" in tl: dt = now - datetime.timedelta(days=int(tl.replace("d","").strip()))
-        elif "h" in tl or "min" in tl or "s" in tl: dt = now
+        m = re.match(r"(\d+)\s*(yr|y)", tl)
+        if m:
+            dt = now - datetime.timedelta(days=int(m.group(1)) * 365)
+        elif m := re.match(r"(\d+)\s*(mo|month)", tl):
+            dt = now - datetime.timedelta(days=int(m.group(1)) * 30)
+        elif m := re.match(r"(\d+)\s*w(?:eek)?s?$", tl):
+            dt = now - datetime.timedelta(weeks=int(m.group(1)))
+        elif m := re.match(r"(\d+)\s*d(?:ay)?s?$", tl):
+            dt = now - datetime.timedelta(days=int(m.group(1)))
         else:
-            for fmt in ["%Y-%m-%d","%Y-%m-%dT%H:%M:%S","%Y-%m-%dT%H:%M:%SZ"]:
+            for fmt in ["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"]:
                 try:
-                    return datetime.datetime.strptime(time_str.replace("Z",""), fmt).strftime("%Y-%m-%d")
-                except: continue
+                    return datetime.datetime.strptime(time_str.replace("Z", ""), fmt).strftime("%Y-%m-%d")
+                except ValueError:
+                    continue
             return time_str
         return dt.strftime("%Y-%m-%d")
-    except:
+    except Exception:
         return time_str
 
 
@@ -817,7 +873,6 @@ def run_apify_twitter(companies: List[Dict], config: Dict) -> List[Dict]:
             continue
         name = comp["name"]
         seen_ids = set(state.get(f"{name}::twitter", []))
-        # parseforge/x-com-scraper uses "usernames" (array) + "maxItems"
         input_data = {
             "usernames": [handle],
             "maxItems": max_items,
@@ -836,7 +891,6 @@ def run_apify_twitter(companies: List[Dict], config: Dict) -> List[Dict]:
         new_ids = []
         is_first_run = len(seen_ids) == 0
         for r in results[:max_items]:
-            # Handle flexible field names
             tid = r.get("id") or r.get("url") or r.get("tweetLink") or ""
             if not tid or tid in seen_ids:
                 continue
@@ -891,7 +945,6 @@ def run_apify_linkedin(companies: List[Dict], config: Dict) -> List[Dict]:
             continue
         name = comp["name"]
         seen_ids = set(state.get(f"{name}::linkedin", []))
-        # supreme_coder/linkedin-post uses urls (string array)
         input_data = {
             "urls": [linkedin_url],
             "limit": max_items,
@@ -911,27 +964,24 @@ def run_apify_linkedin(companies: List[Dict], config: Dict) -> List[Dict]:
         is_first_run = len(seen_ids) == 0
         for r in results[:max_items]:
             if is_first_run:
-                days_ago = parse_linkedin_time(r.get("timeSincePosted", "") or r.get("postedAt", ""))
+                days_ago = _parse_linkedin_days(r.get("timeSincePosted", "") or r.get("postedAt", ""))
                 if days_ago > monitor_days:
                     continue
-            # Flexible ID fields
             pid = r.get("urn") or r.get("url") or r.get("shareUrn") or r.get("id") or ""
             if not pid or pid in seen_ids:
                 continue
             seen_ids.add(pid)
             new_ids.append(pid)
-            # Flexible text fields
             snippet = r.get("text") or r.get("content") or r.get("postText") or ""
             post_url = r.get("url") or linkedin_url
-            # Handle relative time strings vs ISO dates from supreme_coder/linkedin-post
             time_since = r.get("timeSincePosted") or r.get("postedAtISO") or r.get("postedAt") or ""
             pub_date = ""
             if time_since:
-                # If it looks like a relative time (contains d/w/mo/yr), convert it
-                if re.search(r'\d+\s*[dwym]', time_since, re.I) or re.search(r'\d+[dwmoyr]', time_since.lower()):
+                # If it looks like a relative time, convert it
+                if re.search(r'\d+\s*[dwym]', time_since, re.I) or re.search(r'\d+[dwmoyr]', time_since.lower()) \
+                   or re.match(r'\d+', time_since):
                     pub_date = relative_time_to_date(time_since)
                 else:
-                    # Treat as ISO or absolute date
                     pub_date = time_since[:10]
             items.append({
                 "company": name, "source": "apify_linkedin",
@@ -1023,14 +1073,12 @@ def main():
             sys.exit(0)
 
     # ── Normal execution ────────────────────────────────────────────────────
-    # Check if config exists
     if not DEFAULT_CONFIG.exists():
         print("\n[Startup Tracker] 配置文件不存在")
         print(f"期望路径: {DEFAULT_CONFIG}")
         print("\n首次使用？通过对话输入 '/startup-tracker' 或发送公司名称开始配置。")
         sys.exit(1)
 
-    # Load config
     try:
         config, companies = load_config()
     except SystemExit:
@@ -1039,6 +1087,7 @@ def main():
         print(f"\n[Error] 加载配置失败: {e}")
         sys.exit(1)
 
+    max_workers = args.workers
     all_items: List[Dict] = []
 
     # Check configuration status
@@ -1046,65 +1095,56 @@ def main():
 
     print(f"\n=== Startup Tracker ===")
     print(f"监控公司: {len(companies)} 家")
+    print(f"并发 Worker 数: {max_workers}")
     print(f"数据源状态:")
-    print(f"  • Tavily新闻: {'✅' if status['tavily']['valid'] else '❌'}")
-    print(f"  • 网站监控: {'✅' if CRAWL4AI_AVAILABLE else '❌'}")
+    print(f"  • Tavily新闻: {'✅ (并行搜索)' if status['tavily']['valid'] else '❌'}")
+    print(f"  • 网站监控: {'✅ (Crawl4AI, 并行爬取)' if CRAWL4AI_AVAILABLE else '❌'}")
+    print(f"  • Firecrawl: {'✅ (并行爬取)' if status['firecrawl']['configured'] else '⚪ 跳过'}")
     print(f"  • Twitter: ⏭️  请使用 apify-ultimate-scraper skill")
     print(f"  • LinkedIn: ⏭️  请使用 apify-ultimate-scraper skill")
     print()
 
-    # 1. News search via Tavily
-    if status['tavily']['valid']:
-        try:
-            all_items.extend(run_tavily(companies, config))
-        except Exception as e:
-            print(f"[Tavily Error] {e}")
-    else:
-        print("[Tavily] 跳过 - API Key 未配置或无效")
-
-    # 2. Website monitor
+    # ── Parallel execution of independent data sources ───────────────────────
+    # Crawl4AI runs in main thread (uses asyncio internally, incompatible with ThreadPoolExecutor)
+    # Tavily and Firecrawl run in parallel threads
     if CRAWL4AI_AVAILABLE:
         try:
             all_items.extend(run_crawl4ai(companies, config))
         except Exception as e:
             print(f"[Crawl4AI Error] {e}")
-    else:
-        print("[Crawl4AI] 跳过 - 未安装 (pip install crawl4ai)")
 
-    # 3. Website monitor via Firecrawl
-    if status['firecrawl']['configured']:
-        try:
-            all_items.extend(run_firecrawl(companies, config))
-        except Exception as e:
-            print(f"[Firecrawl Error] {e}")
-    else:
+    futures = {}
+    tavily_count = 1 if status['tavily']['valid'] else 0
+    firecrawl_count = 1 if status['firecrawl']['configured'] else 0
+    worker_count = tavily_count + firecrawl_count
+
+    if worker_count > 0:
+        with ThreadPoolExecutor(max_workers=min(worker_count, 2)) as executor:
+            if status['tavily']['valid']:
+                futures[executor.submit(run_tavily, companies, config, max_workers)] = "Tavily"
+            if status['firecrawl']['configured']:
+                futures[executor.submit(run_firecrawl, companies, config, max_workers)] = "Firecrawl"
+
+            for future in as_completed(futures):
+                source_name = futures[future]
+                try:
+                    items = future.result()
+                    all_items.extend(items)
+                except Exception as e:
+                    print(f"[{source_name} Error] {e}")
+
+    # Check for skipped sources
+    if not status['tavily']['valid']:
+        print("[Tavily] 跳过 - API Key 未配置或无效")
+    if not CRAWL4AI_AVAILABLE:
+        print("[Crawl4AI] 跳过 - 未安装 (pip install crawl4ai)")
+    if not status['firecrawl']['configured']:
         print("[Firecrawl] 跳过 - API Key 未配置")
 
-    # 4. Twitter via Apify — DISABLED (api.apify.com unreachable from China)
+    # 4. Twitter via Apify — DISABLED
     #   Use apify-ultimate-scraper skill instead for Twitter/LinkedIn scraping
-    # if status['apify']['valid'] and status['twitter_enabled']:
-    #     try:
-    #         all_items.extend(run_apify_twitter(companies, config))
-    #     except Exception as e:
-    #         print(f"[Apify Twitter Error] {e}")
-    # else:
-    #     if not status['apify']['valid']:
-    #         print("[Apify Twitter] 跳过 - API Token 未配置")
-    #     elif not status['twitter_enabled']:
-    #         print("[Apify Twitter] 跳过 - 没有配置 Twitter 账号")
-
-    # 5. LinkedIn via Apify — DISABLED (api.apify.com unreachable from China)
+    # 5. LinkedIn via Apify — DISABLED
     #   Use apify-ultimate-scraper skill instead for Twitter/LinkedIn scraping
-    # if status['apify']['valid'] and status['linkedin_enabled']:
-    #     try:
-    #         all_items.extend(run_apify_linkedin(companies, config))
-    #     except Exception as e:
-    #         print(f"[Apify LinkedIn Error] {e}")
-    # else:
-    #     if not status['apify']['valid']:
-    #         print("[Apify LinkedIn] 跳过 - API Token 未配置")
-    #     elif not status['linkedin_enabled']:
-    #         print("[Apify LinkedIn] 跳过 - 没有配置 LinkedIn URL")
 
     # Console summary
     today_str = datetime.datetime.now().strftime("%Y-%m-%d")
