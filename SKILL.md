@@ -103,8 +103,9 @@ description: |
     "max_content_chars": 2000,
     "use_article_signature": true
   },
+  "monitor_interval_days": 14,
   "tavily": {
-    "search_days_back": 7,
+    "search_days_back": 14,
     "max_results_per_company": 15,
     "search_query": "funding OR raised OR acquired OR acquisition OR merger OR IPO OR partnership OR launch OR expansion OR investment OR product OR hiring or series",
     "major_keywords": ["funding","raises","raised","million","acquired","acquisition","IPO","series A","series B","series C","seed round","partnership","launch","shut down","layoff","appointed CEO","appointed CTO"]
@@ -166,14 +167,26 @@ description: |
 ### Step 2：搜索并确认公司信息
 使用 `tavily-search` skill 或 `WebSearch` 搜索每个公司的官网、Twitter、LinkedIn 链接，展示给用户确认。
 
-### Step 3：配置 API Keys
+### Step 3：配置监控频率
+默认监控周期为 **14 天**（搜索过去 14 天的动态）。询问用户是否需要调整：
+- 可选周期：1 天（高频日报）、3 天、7 天（周报）、14 天（默认，推荐）、30 天（月报）
+- 也可通过命令行 `python tracker.py --days N` 单次覆盖，不修改配置
+
+**同时主动询问**：是否需要设置自动定时运行？
+- startup-tracker **没有**内置自动定时功能，每次运行由 Agent 手动触发
+- 如用户希望定期自动执行，建议通过外部调度（如 cron / OpenClaw 定时任务 / CI pipeline）定期触发 `/startup-tracker`
+- 如果用户暂不需要，跳过即可，后续可随时通过"设置定时运行"命令重新配置
+
+推荐语术："目前监控周期默认是 14 天，你想调整吗？另外这个 skill 不会自动定时运行，需要我帮你设置一个定时任务吗？（比如每周一自动跑一次）"
+
+### Step 4：配置 API Keys
 引导用户配置：
 - **Tavily API Key**（必需）：获取地址 https://tavily.com
 - **Apify Token**（社交媒体监控必需）：获取地址 https://console.apify.com/account/integrations
 
 写入 `Track_skill/.env` 文件或 `config.json`。
 
-### Step 4：保存 config.json 并运行首次监控
+### Step 5：保存 config.json 并运行首次监控
 按以下"运行监控"章节的流程执行。
 
 ---
@@ -392,7 +405,7 @@ node --env-file=.env <apify-skill-dir>/reference/scripts/run_actor.js \
 执行 `python tracker.py`，展示结果，并解释：
 - Crawl4AI 首次运行只建立网站基线 hash，不产生变更告警，从第二次运行才开始检测
 - "Example AI" 这类测试公司无新闻属正常（无实际业务的公司不会有媒体报道）
-- 0 条动态可能意味着：公司太早期、监控窗口（7 天）太短、公司处于静默期
+- 0 条动态可能意味着：公司太早期、监控窗口太短、公司处于静默期
 
 ---
 
@@ -441,7 +454,7 @@ Agent 合并结果时必须根据内容判断 `importance`：
 **报告日期**: YYYY-MM-DD
 **监控公司**: N 家
 **数据源**: Tavily 新闻 | Crawl4AI 网站监控 | Apify Twitter | Apify LinkedIn
-**时间范围**: 过去 7 天
+**时间范围**: 过去 {monitor_days} 天
 
 ---
 
@@ -482,7 +495,7 @@ Agent 合并结果时必须根据内容判断 `importance`：
 
 ## 无动态公司
 
-以下公司在过去 7 天内无可见信号：
+以下公司在过去 {monitor_days} 天内无可见信号：
 - 公司B（可能仍为早期阶段，或社交媒体未活跃）
 ```
 
@@ -493,7 +506,7 @@ Agent 合并结果时必须根据内容判断 `importance`：
 4. **无动态也要列**：归入"无动态公司"区域
 5. **数据源标签**：[Tavily]、[Website]、[Twitter]、[LinkedIn]
 6. 如果某个数据源因配置问题被跳过，在报告开头注明"⚠️ 数据源跳过说明"
-7. 如果所有公司都无动态，报告必须包含："本周无可见信号——可能原因：监控公司为早期阶段/监控时间窗口（7 天）较短/公司处于静默期"
+7. 如果所有公司都无动态，报告必须包含："本周期无可见信号——可能原因：监控公司为早期阶段/监控时间窗口较短/公司处于静默期"
 
 ---
 
@@ -507,6 +520,8 @@ Agent 合并结果时必须根据内容判断 `importance`：
 | "查看当前配置" | 读取并格式化展示 config.json |
 | "更新 API Key" | 询问哪个 key → 验证 → 保存至 .env |
 | "切换数据源" | 询问启用/禁用哪些数据源 → 更新 config.json |
+| "修改监控周期" | 询问新的天数（1/3/7/14/30） → 更新 config.json 中的 `monitor_interval_days` |
+| "设置自动运行" | 告知用户 skill 无内置定时功能 → 引导通过外部调度（cron/OpenClaw/CI）定期触发 `/startup-tracker` |
 | "查看状态" | 运行 `python tracker.py --validate` 并展示结果 |
 | "重置历史" | 清空 `state/` 目录下的状态文件 |
 

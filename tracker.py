@@ -54,6 +54,8 @@ parser.add_argument("--list", action="store_true",
                     help="Show current configuration summary")
 parser.add_argument("--validate", action="store_true",
                     help="Validate API keys without running full scan")
+parser.add_argument("--days", type=int, default=None,
+                    help="Override monitoring window in days (overrides config.monitor_interval_days and tavily.search_days_back)")
 args = parser.parse_args()
 
 # ── Paths ────────────────────────────────────────────────────────────────────
@@ -116,6 +118,17 @@ def load_config():
     TAVILY_KEY    = _key("tavily-key", "TAVILY_API_KEY")
     FIRECRAWL_KEY = _key("firecrawl-key", "FIRECRAWL_API_KEY")
     APIFY_KEY     = _key("apify-key", "APIFY_TOKEN")
+
+    # ── Resolve monitoring days: CLI --days > config.monitor_interval_days > tavily.search_days_back > 7 ──
+    monitor_days = args.days
+    if monitor_days is None:
+        monitor_days = cfg.get("monitor_interval_days")
+    if monitor_days is None:
+        monitor_days = cfg.get("tavily", {}).get("search_days_back", 7)
+    # Also update tavily.search_days_back so downstream functions see the same window
+    tavily_cfg = cfg.setdefault("tavily", {})
+    tavily_cfg["search_days_back"] = monitor_days
+    monitor_days = max(1, monitor_days)
 
     # Set globals for data source functions
     global TAVILY_API_KEY, FIRECRAWL_API_KEY, APIFY_TOKEN
@@ -794,6 +807,7 @@ def run_apify_twitter(companies: List[Dict], config: Dict) -> List[Dict]:
     max_items = config.get("apify", {}).get("max_tweets_per_run", 10)
     poll_int = config.get("apify", {}).get("poll_interval_sec", 5)
     max_poll = config.get("apify", {}).get("max_poll_sec", 120)
+    monitor_days = config.get("tavily", {}).get("search_days_back", 7)
     state = load_json(APIFY_STATE, {})
     items = []
 
@@ -832,7 +846,7 @@ def run_apify_twitter(companies: List[Dict], config: Dict) -> List[Dict]:
                     try:
                         tweet_date = datetime.datetime.fromisoformat(created_at.replace("Z", "+00:00"))
                         days_ago = (datetime.datetime.now(datetime.timezone.utc) - tweet_date).days
-                        if days_ago > 7:
+                        if days_ago > monitor_days:
                             continue
                     except Exception:
                         pass
@@ -867,6 +881,7 @@ def run_apify_linkedin(companies: List[Dict], config: Dict) -> List[Dict]:
     max_items = config.get("apify", {}).get("max_linkedin_posts_per_run", 10)
     poll_int = config.get("apify", {}).get("poll_interval_sec", 5)
     max_poll = config.get("apify", {}).get("max_poll_sec", 120)
+    monitor_days = config.get("tavily", {}).get("search_days_back", 7)
     state = load_json(APIFY_STATE, {})
     items = []
 
@@ -897,7 +912,7 @@ def run_apify_linkedin(companies: List[Dict], config: Dict) -> List[Dict]:
         for r in results[:max_items]:
             if is_first_run:
                 days_ago = parse_linkedin_time(r.get("timeSincePosted", "") or r.get("postedAt", ""))
-                if days_ago > 7:
+                if days_ago > monitor_days:
                     continue
             # Flexible ID fields
             pid = r.get("urn") or r.get("url") or r.get("shareUrn") or r.get("id") or ""

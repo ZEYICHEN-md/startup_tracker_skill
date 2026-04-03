@@ -1,6 +1,6 @@
 # Startup Tracker
 
-Automatically monitor startups for weekly signals — funding rounds, product launches, partnerships, leadership hires, and other notable developments — across news sources, websites, and social media.
+Automatically monitor startups for configurable-period signals — funding rounds, product launches, partnerships, leadership hires, and other notable developments — across news sources, websites, and social media.
 
 Designed for VC investors, analysts, and researchers tracking early-stage companies.
 
