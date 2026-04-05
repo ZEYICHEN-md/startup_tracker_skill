@@ -1,0 +1,20 @@
+{
+  "skill_name": "startup-tracker",
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "帮我跑一下 startup tracker，看看上周 Virtue AI 和 Nexus AI 有什么新动态",
+      "expected_output": "Agent runs tracker and provides a conversational summary of findings for monitored companies"
+    },
+    {
+      "id": 1,
+      "prompt": "我最近发现了一家叫 'Anthropic' 的 AI 安全公司，想帮我把他们加到 startup tracker 的监控列表里。他们的官网是 https://www.anthropic.com",
+      "expected_output": "Agent adds Anthropic to config.json while preserving existing entries, without errors for missing social links"
+    },
+    {
+      "id": 2,
+      "prompt": "startup tracker 的监控周期现在是多久？改成 7 天，我想每周自动跑一次",
+      "expected_output": "Agent shows current interval (14 days), updates to 7, explains that auto-scheduling requires external setup"
+    }
+  ]
+}
